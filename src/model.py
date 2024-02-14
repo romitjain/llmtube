@@ -1,25 +1,29 @@
+import sys
 import json
 import torch
 import openai
-import logging
 import backoff
+from loguru import logger
 from typing import Tuple, Dict, List
+from sklearn.cluster import KMeans
+from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 from .utils import log_time
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s %(levelname)s] %(message)s',
-    datefmt='%Y-%d-%m %H:%M:%S', encoding="utf-8"
-)
-logger = logging.getLogger(__name__)
+logger.remove()
+logger.add(sys.stdout, format="[{time: YYYY-MM-DD HH:mm:ss} {level}] {message}", level="DEBUG")
+
+def add_assistant_msg_json(x): return {'role': 'assistant', 'content': json.dumps(x)}
+def add_usr_msg_json(x): return {'role': 'user', 'content': json.dumps(x)}
+def add_assistant_msg(x): return {'role': 'assistant', 'content': x}
+def add_usr_msg(x): return {'role': 'user', 'content': x}
 
 class Transcriber():
 
     def __init__(
             self,
-            model_id: str = "openai/whisper-large-v3",
+            model_id: str = "openai/whisper-large-v2",
             device: str = 'cuda:0',
             torch_dtype: torch.dtype = torch.float16
         ) -> None:
@@ -49,20 +53,16 @@ class Transcriber():
             device=device,
         )
 
-    @log_time
+        logger.info("Loaded the model in memory")
+
+    @log_time(name='transcriber')
     def __call__(self, audio_path:str = None, audio: torch.Tensor = None):
         if audio_path:
             return self.pipe(audio_path)
         
         return self.pipe(audio)
 
-def add_assistant_msg_json(x): return {'role': 'assistant', 'content': json.dumps(x)}
-def add_usr_msg_json(x): return {'role': 'user', 'content': json.dumps(x)}
-def add_assistant_msg(x): return {'role': 'assistant', 'content': x}
-def add_usr_msg(x): return {'role': 'user', 'content': x}
-
-
-class Summarizer():
+class LLM():
     """
     Wrapper over LLM
     """
@@ -77,7 +77,7 @@ class Summarizer():
         self.input_tokens = 0
         self.output_tokens = 0
 
-    @log_time
+    @log_time(name='llm')
     @backoff.on_exception(backoff.expo, openai.RateLimitError, max_time=300)
     def __call__(
         self,
@@ -139,64 +139,49 @@ class Summarizer():
             return op
 
 
-class VideoSummarizer():
-    def __init__(self, model_id: str, messages: List = [], uri: str = None) -> None:
-        from dotenv import load_dotenv
-        load_dotenv()
+class Embedder():
+    def __init__(self, model_id: str = "sentence-transformers/all-mpnet-base-v2"):
+        self.model = SentenceTransformer(model_id)
 
-        self.client = openai.OpenAI(base_url=uri)
-        self.model_id = model_id
-        self.messages = messages
-        self.total_tokens = 0
-        self.input_tokens = 0
-        self.output_tokens = 0
+    @log_time(name='embedder')
+    def __call__(self, paragraphs: List[str]) -> Dict:
 
-    @backoff.on_exception(backoff.expo, openai.RateLimitError, max_time=300)
-    def __call__(
-        self,
-        message: str,
-        image: str = None,
-        **kwargs
-    ) -> Tuple[Dict, any]:
+        logger.debug(f"Paragraphs: {paragraphs}")
 
-        self._add_usr_msg(message, image)
+        paragraph_embeddings = self.model.encode(paragraphs)
 
-        completions = self.client.chat.completions.create(
-            model=self.model_id,
-            messages=self.messages,
-            **kwargs
-        )
+        embedding_dict = {}
+        for idx, embedding in enumerate(paragraph_embeddings):
+            embedding_dict[idx] = embedding
 
-        op = completions.choices[0].message.content
+        return embedding_dict
 
-        logger.debug(f'Prompts: {message}, output: {op}')
-        logger.debug(
-            f'Tokens used in generation using {self.model_id}: {completions.usage}')
+    @log_time(name='clustering')
+    def cluster(self, embeddings: Dict, k: int = 5) -> Dict:
+        """
+        Cluster the embeddings into `k` clusters
+        using K means
 
-        self._add_assistant_msg(op)
+        Args:
+            embeddings (Dict): { idx: embedding }
+            k (int, optional): Number of clusters. Defaults to 5.
 
-        self.total_tokens += completions.usage.total_tokens
-        self.input_tokens += completions.usage.prompt_tokens
-        self.output_tokens += completions.usage.completion_tokens
+        Returns:
+            Dict: { label: [idxs] }
+        """
+        num_clusters = min(k, len(embeddings.keys()))
+        logger.info(f"Using n={num_clusters} for clustering")
 
-        return op
+        kmeans = KMeans(n_clusters=num_clusters, random_state=0).fit(list(embeddings.values()))
+        cluster_labels = kmeans.labels_
+        logger.info(f"Clustering labels: {cluster_labels}")
+        logger.info(f"Clustering labels dimension: {cluster_labels.shape}")
 
-    def _add_usr_msg(self, msg: str, img: str = None):
+        clustering_dict = {}
+        for idx, label in enumerate(cluster_labels):
+            temp: List = clustering_dict.get(label, [])
+            temp.append(idx)
 
-        content = [{'type': 'text', 'text': msg}]
-        if img:
-            content.append({
-                'type': 'image_url',
-                'image_url': {'url': f"data:image/jpeg;base64,{img}"}
-            })
+            clustering_dict.update({int(label): temp})
 
-        self.messages.append({
-            'role': 'user',
-            'content': content
-        })
-
-    def _add_assistant_msg(self, msg: str, role: str = 'assistant'):
-        self.messages.append({
-            'role': role,
-            'content': [{'type': 'text', 'text': msg}]
-        })
+        return clustering_dict
